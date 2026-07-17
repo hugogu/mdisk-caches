@@ -11,7 +11,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from mdisk_caches.detect import get_os
 
@@ -23,13 +23,13 @@ SUPPORTED_TOOLS = [
 # Each tool's "old → new" cache path. Keep these in one place so the
 # README, the configure_* implementations, and the test suite can share
 # a single source of truth.
-OLD_PATHS: Dict[str, Path] = {
-    "maven":  Path.home() / ".m2" / "repository",
-    "gradle": Path.home() / ".gradle",
-    "npm":    Path.home() / ".npm",
-    "pnpm":   Path.home() / ".pnpm-store",
-    "pip":    Path.home() / ".cache" / "pip",
-    "cargo":  Path.home() / ".cargo",
+OLD_PATHS: Dict[str, Callable[[], Path]] = {
+    "maven": lambda: Path.home() / ".m2" / "repository",
+    "gradle": lambda: Path.home() / ".gradle",
+    "npm": lambda: Path.home() / ".npm",
+    "pnpm": lambda: Path.home() / ".pnpm-store",
+    "pip": lambda: Path.home() / ".cache" / "pip",
+    "cargo": lambda: Path.home() / ".cargo",
     # tmpdir has no per-user cache to migrate; docker_buildkit has no
     # on-disk cache; both are config-only.
 }
@@ -169,7 +169,7 @@ def configure_maven(
     if dry_run:
         msg = f"[DRY-RUN] Would set Maven localRepository to {new_repo}"
         if migrate:
-            msg += f"; {migrate_directory(OLD_PATHS['maven'], new_repo, dry_run=True)}"
+            msg += f"; {migrate_directory(OLD_PATHS['maven'](), new_repo, dry_run=True)}"
         return msg
     m2_dir.mkdir(parents=True, exist_ok=True)
     new_repo.mkdir(parents=True, exist_ok=True)
@@ -199,7 +199,7 @@ def configure_maven(
         configure_msg = f"Updated Maven localRepository to {new_repo} (backup: {backup})"
 
     if migrate:
-        configure_msg += f"; {migrate_directory(OLD_PATHS['maven'], new_repo)}"
+        configure_msg += f"; {migrate_directory(OLD_PATHS['maven'](), new_repo)}"
     return configure_msg
 
 
@@ -211,13 +211,13 @@ def configure_gradle(
     if dry_run:
         msg = f"[DRY-RUN] Would set GRADLE_USER_HOME={new_home}"
         if migrate:
-            msg += f"; {migrate_directory(OLD_PATHS['gradle'], new_home, dry_run=True)}"
+            msg += f"; {migrate_directory(OLD_PATHS['gradle'](), new_home, dry_run=True)}"
         return msg
     new_home.mkdir(parents=True, exist_ok=True)
     env_line = f'export GRADLE_USER_HOME="{new_home}"\n'
     configure_msg = f"Set GRADLE_USER_HOME={new_home} ({_add_or_replace_in_shell_rc('GRADLE_USER_HOME', env_line)})"
     if migrate:
-        configure_msg += f"; {migrate_directory(OLD_PATHS['gradle'], new_home)}"
+        configure_msg += f"; {migrate_directory(OLD_PATHS['gradle'](), new_home)}"
     return configure_msg
 
 
@@ -259,7 +259,7 @@ def configure_pnpm(
     if dry_run:
         msg = f"[DRY-RUN] Would run: pnpm config set store-dir {new_store}"
         if migrate:
-            msg += f"; {migrate_directory(OLD_PATHS['pnpm'], new_store, dry_run=True)}"
+            msg += f"; {migrate_directory(OLD_PATHS['pnpm'](), new_store, dry_run=True)}"
         return msg
     new_store.mkdir(parents=True, exist_ok=True)
     try:
@@ -271,7 +271,7 @@ def configure_pnpm(
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         return f"pnpm command failed ({e}); manually set: pnpm config set store-dir {new_store}"
     if migrate:
-        configure_msg += f"; {migrate_directory(OLD_PATHS['pnpm'], new_store)}"
+        configure_msg += f"; {migrate_directory(OLD_PATHS['pnpm'](), new_store)}"
     return configure_msg
 
 
@@ -283,13 +283,13 @@ def configure_pip(
     if dry_run:
         msg = f"[DRY-RUN] Would set PIP_CACHE_DIR={new_cache}"
         if migrate:
-            msg += f"; {migrate_directory(OLD_PATHS['pip'], new_cache, dry_run=True)}"
+            msg += f"; {migrate_directory(OLD_PATHS['pip'](), new_cache, dry_run=True)}"
         return msg
     new_cache.mkdir(parents=True, exist_ok=True)
     env_line = f'export PIP_CACHE_DIR="{new_cache}"\n'
     configure_msg = f"Set PIP_CACHE_DIR={new_cache} ({_add_or_replace_in_shell_rc('PIP_CACHE_DIR', env_line)})"
     if migrate:
-        configure_msg += f"; {migrate_directory(OLD_PATHS['pip'], new_cache)}"
+        configure_msg += f"; {migrate_directory(OLD_PATHS['pip'](), new_cache)}"
     return configure_msg
 
 
@@ -301,13 +301,13 @@ def configure_cargo(
     if dry_run:
         msg = f"[DRY-RUN] Would set CARGO_HOME={new_home}"
         if migrate:
-            msg += f"; {migrate_directory(OLD_PATHS['cargo'], new_home, dry_run=True)}"
+            msg += f"; {migrate_directory(OLD_PATHS['cargo'](), new_home, dry_run=True)}"
         return msg
     new_home.mkdir(parents=True, exist_ok=True)
     env_line = f'export CARGO_HOME="{new_home}"\n'
     configure_msg = f"Set CARGO_HOME={new_home} ({_add_or_replace_in_shell_rc('CARGO_HOME', env_line)})"
     if migrate:
-        configure_msg += f"; {migrate_directory(OLD_PATHS['cargo'], new_home)}"
+        configure_msg += f"; {migrate_directory(OLD_PATHS['cargo'](), new_home)}"
     return configure_msg
 
 
