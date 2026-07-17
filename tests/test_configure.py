@@ -203,21 +203,23 @@ def test_migrate_directory_keeps_nonempty_old():
         _in_tmp(tmp, run)
 
 
-def test_migrate_directory_idempotent_same_path():
-    """If src resolves to dst (e.g. user symlinked it), no-op."""
+def test_migrate_directory_existing_symlink_is_removed():
+    """A symlink already pointing at dst means the user pre-redirected;
+    remove the symlink instead of copying data (which would be a no-op
+    double-move)."""
     with tempfile.TemporaryDirectory() as tmp:
         def run(fake_home):
             real = fake_home / "real"
             real.mkdir()
             _write(real / "x", "X")
-            # src is a symlink that points to real
+            # src is a symlink that points to real (= dst)
             src = fake_home / "link"
             src.symlink_to(real)
-            # dst == real
             result = migrate_directory(src, real)
-            assert "same path" in result
-            # The symlink should still be there
-            assert src.is_symlink()
+            assert "removed symlink" in result
+            assert not src.exists()
+            # The data at dst is untouched
+            assert (real / "x").read_text() == "X"
         _in_tmp(tmp, run)
 
 

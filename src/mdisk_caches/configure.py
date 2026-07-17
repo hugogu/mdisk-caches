@@ -106,16 +106,30 @@ def migrate_directory(
     dst.mkdir(parents=True, exist_ok=True)
     moved, failed = 0, []
     for entry in src.iterdir():
+        # Skip dotfiles / dot-dirs. Cache directories are full of
+        # ``.cache/``, ``.DS_Store`` etc. that don't belong on tmpfs.
+        if entry.name.startswith("."):
+            continue
+        # Preserve the relative path so nested cache structures
+        # (e.g. ``repository/com/foo/bar.jar``) land at the matching
+        # nested path under ``dst`` instead of being flattened to the
+        # leaf name. ``shutil.move`` will create parent dirs as part
+        # of the move on the same FS, but on cross-FS it copies into
+        # a non-existent target directory and fails — so we
+        # pre-create the parent path explicitly.
+        rel = entry.relative_to(src)
+        target = dst / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
         try:
             # ``shutil.move`` uses os.rename() on the same FS and
             # copy+delete across FS boundaries. tmpfs is almost
             # always a different FS from disk, so the cross-FS path
             # is what runs in practice. Existing files in dst are
             # overwritten by the copy step.
-            shutil.move(str(entry), str(dst / entry.name))
+            shutil.move(str(entry), str(target))
             moved += 1
         except OSError as exc:
-            failed.append(f"{entry.name}: {exc}")
+            failed.append(f"{rel}: {exc}")
 
     cleanup_msg = ""
     try:
