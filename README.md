@@ -83,6 +83,21 @@ mdisk-caches configure --tool maven --yes
 mdisk-caches configure --all --yes --no-migrate
 ```
 
+### Migrate existing cache data
+
+If you already ran `configure` with `--no-migrate` (or migrated manually) and want to move the data later without touching tool configs again:
+
+```bash
+# Preview migration for all tools
+mdisk-caches migrate --dry-run
+
+# Migrate all tools
+mdisk-caches migrate --yes
+
+# Migrate a single tool
+mdisk-caches migrate --tool maven --yes
+```
+
 Supported tools:
 
 | Tool | Configuration Method |

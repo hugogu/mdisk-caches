@@ -13,7 +13,7 @@ from mdisk_caches.mount import (
     is_mounted,
     get_disk_usage,
 )
-from mdisk_caches.configure import configure_all, SUPPORTED_TOOLS
+from mdisk_caches.configure import configure_all, SUPPORTED_TOOLS, OLD_PATHS, migrate_directory
 from mdisk_caches.report import generate_report
 
 
@@ -95,6 +95,30 @@ def cmd_configure(args):
     results = configure_all(mount_point, dry_run=args.dry_run, migrate=not args.no_migrate)
     for t in tools:
         print(f"{t:15} {results.get(t, 'not supported')}")
+
+
+def cmd_migrate(args):
+    """Migrate existing cache data to RAM disk without re-configuring tools."""
+    from mdisk_caches.detect import SystemInfo
+    from mdisk_caches.recommend import recommend
+
+    info = SystemInfo()
+    rec = recommend(info)
+    mount_point = args.mount or rec["mount_point"]
+
+    tools = [args.tool] if args.tool else list(OLD_PATHS.keys())
+
+    if not args.dry_run and not args.yes:
+        msg = f"Migrate cache data for {', '.join(tools)} to {mount_point}? [y/N] "
+        if input(msg).lower() != "y":
+            print("Aborted.")
+            return
+
+    for tool in tools:
+        old_path = OLD_PATHS[tool]()
+        new_path = Path(mount_point) / tool
+        result = migrate_directory(old_path, new_path, dry_run=args.dry_run)
+        print(f"{tool:15} {result}")
 
 
 def cmd_cleanup(args):
@@ -205,6 +229,16 @@ def main():
              "old directory.",
     )
     p_configure.set_defaults(func=cmd_configure)
+
+    # migrate
+    p_migrate = subparsers.add_parser(
+        "migrate", help="Move existing cache data to RAM disk"
+    )
+    p_migrate.add_argument("--mount", "-m", default=None, help="Mount point")
+    p_migrate.add_argument("--tool", "-t", default=None, help="Tool to migrate")
+    p_migrate.add_argument("--dry-run", action="store_true", help="Show what would be done")
+    p_migrate.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+    p_migrate.set_defaults(func=cmd_migrate)
 
     # status
     p_status = subparsers.add_parser("status", help="Show current RAM disk status")

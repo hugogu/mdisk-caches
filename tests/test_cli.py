@@ -53,6 +53,12 @@ def test_configure_dry_run():
     assert "DRY-RUN" in out or "dry-run" in out.lower(), f"unexpected output: {out}"
 
 
+def test_migrate_dry_run():
+    code, out, err = run_cmd(["migrate", "--dry-run"])
+    assert code == 0, f"exit code {code}: {err}"
+    assert "DRY-RUN" in out or "dry-run" in out.lower(), f"unexpected output: {out}"
+
+
 def test_status():
     code, out, err = run_cmd(["status"])
     assert code == 0, f"exit code {code}: {err}"
