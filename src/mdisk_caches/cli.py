@@ -92,7 +92,7 @@ def cmd_configure(args):
             print("Aborted.")
             return
 
-    results = configure_all(mount_point, dry_run=args.dry_run)
+    results = configure_all(mount_point, dry_run=args.dry_run, migrate=not args.no_migrate)
     for t in tools:
         print(f"{t:15} {results.get(t, 'not supported')}")
 
@@ -197,6 +197,13 @@ def main():
     p_configure.add_argument("--all", action="store_true", help="Configure all tools")
     p_configure.add_argument("--dry-run", action="store_true", help="Show what would be done")
     p_configure.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+    p_configure.add_argument(
+        "--no-migrate",
+        action="store_true",
+        help="Skip moving existing cache data from old locations to the new "
+             "tmpfs. Default behaviour copies data then removes the empty "
+             "old directory.",
+    )
     p_configure.set_defaults(func=cmd_configure)
 
     # status

@@ -70,14 +70,17 @@ mdisk-caches create --size 8G --mount /mnt/my-ramdisk --yes
 ### Configure tools
 
 ```bash
-# Preview all tool configurations
+# Preview all tool configurations (including the planned migration)
 mdisk-caches configure --all --dry-run
 
-# Apply all configurations
+# Apply all configurations (with migration of existing cache data)
 mdisk-caches configure --all --yes
 
 # Configure a single tool
 mdisk-caches configure --tool maven --yes
+
+# Skip moving existing data (only redirect the path)
+mdisk-caches configure --all --yes --no-migrate
 ```
 
 Supported tools:
@@ -92,6 +95,26 @@ Supported tools:
 | cargo | `CARGO_HOME` env var (in shell rc) |
 | TMPDIR | `TMPDIR` env var (in shell rc) |
 | Docker | Prints BuildKit `--mount=type=cache` hints |
+
+After `configure` points a tool at the new tmpfs location, by default
+`mdisk-caches` also **migrates the existing cache data** from the
+tool's old on-disk location to the new one and removes the now-empty
+old directory. The migration is:
+
+- **Per-tool scoped**: each tool's known old cache path is moved to
+  its new tmpfs path. For example, `~/.m2/repository` → `<mount>/maven-repo`.
+- **Cross-filesystem safe**: uses `shutil.move`, which copies + deletes
+  when crossing the disk→tmpfs boundary.
+- **Idempotent**: re-running is a no-op if the old directory is already gone
+  or already a symlink to the new location.
+- **Safe by default**: a non-empty old directory (e.g. with a hidden
+  file) is **kept** with a warning instead of being force-deleted.
+- **Opt-out**: pass `--no-migrate` to skip the data move entirely.
+- **Dry-run aware**: `configure --dry-run` reports exactly what would
+  be moved (with file count) without touching anything.
+
+Tools without an on-disk cache to migrate (`tmpdir`, `docker_buildkit`)
+are no-ops for the migration step.
 
 ### Check status
 
@@ -150,7 +173,7 @@ All modules use the Python standard library only — no external dependencies.
 - **Default to dry-run**: All `create` and `configure` commands support `--dry-run` to preview changes
 - **Confirmation prompts**: Commands that modify the system ask for confirmation unless `--yes` is provided
 - **Backups**: `configure` commands back up existing config files (e.g., `settings.xml.backup`) before modification
-- **No data loss**: The tool only redirects caches; it does not move existing data
+- **Optional migration**: After redirecting, optionally move existing on-disk cache data to the new tmpfs location and remove the now-empty old directory. Pass ``--no-migrate`` to skip.
 
 ## Testing
 
@@ -159,7 +182,7 @@ All modules use the Python standard library only — no external dependencies.
 python3 run_tests.py
 ```
 
-33 tests covering:
+41 tests covering:
 - System detection (OS, RAM, cache sizes)
 - Recommendation logic
 - Mount operations (dry-run and actual tmpfs integration)

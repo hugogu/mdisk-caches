@@ -1,10 +1,17 @@
-"""Configure third-party tools to use RAM disk."""
+"""Configure third-party tools to use RAM disk.
+
+After pointing each tool at the new tmpfs location, we also offer a
+migration step that moves existing data from the tool's old cache
+location to the new one. This is opt-out via ``--no-migrate`` and is
+skipped automatically in dry-run mode unless ``--dry-run-migrate`` is
+given.
+"""
 import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from mdisk_caches.detect import get_os
 
@@ -13,138 +20,325 @@ SUPPORTED_TOOLS = [
     "tmpdir", "docker_buildkit",
 ]
 
+# Each tool's "old → new" cache path. Keep these in one place so the
+# README, the configure_* implementations, and the test suite can share
+# a single source of truth.
+OLD_PATHS: Dict[str, Path] = {
+    "maven":  Path.home() / ".m2" / "repository",
+    "gradle": Path.home() / ".gradle",
+    "npm":    Path.home() / ".npm",
+    "pnpm":   Path.home() / ".pnpm-store",
+    "pip":    Path.home() / ".cache" / "pip",
+    "cargo":  Path.home() / ".cargo",
+    # tmpdir has no per-user cache to migrate; docker_buildkit has no
+    # on-disk cache; both are config-only.
+}
 
-def configure_all(mount_point: str, dry_run: bool = False) -> Dict[str, str]:
-    """Configure all supported tools. Returns dict of tool -> result message."""
+
+def configure_all(
+    mount_point: str,
+    dry_run: bool = False,
+    migrate: bool = True,
+) -> Dict[str, str]:
+    """Configure all supported tools.
+
+    ``migrate`` controls whether existing data is also moved to the
+    new location (default True). It is automatically suppressed in
+    dry-run mode unless callers explicitly want the migration report.
+    """
     results = {}
     for tool in SUPPORTED_TOOLS:
         func = globals().get(f"configure_{tool}")
         if func:
-            results[tool] = func(mount_point, dry_run)
+            results[tool] = func(mount_point, dry_run, migrate=migrate)
     return results
 
 
-def configure_maven(mount_point: str, dry_run: bool = False) -> str:
+# ---------------------------------------------------------------------------
+# Migration helper
+# ---------------------------------------------------------------------------
+
+
+def migrate_directory(
+    src: Path,
+    dst: Path,
+    dry_run: bool = False,
+) -> str:
+    """Move the contents of ``src`` to ``dst`` and remove ``src`` if empty.
+
+    Behaviour:
+      - If ``src`` does not exist: "no old data, nothing to do".
+      - If ``src`` is a symlink to ``dst``: remove the symlink, no copy.
+      - If ``src`` resolves to the same path as ``dst`` (e.g. user already
+        redirected earlier): no-op.
+      - Otherwise: ``shutil.move`` every entry; ``shutil.move`` falls back
+        to copy+delete when crossing filesystems, which is exactly what
+        we need when the destination is tmpfs and the source is on disk.
+        Existing files in ``dst`` with the same name are overwritten.
+      - After moving, ``src.rmdir()`` succeeds only when nothing is left
+        behind. If hidden files / sub-mounts remain, the old directory
+        is kept and a warning is reported so the user can clean up by
+        hand.
+
+    Returns a short human-readable status string suitable for printing
+    or returning from a ``configure_*`` function.
+    """
+    if not src.exists() and not src.is_symlink():
+        return f"no old data at {src} (nothing to migrate)"
+    if src.is_symlink() and src.resolve() == dst.resolve():
+        if dry_run:
+            return f"[DRY-RUN] would remove symlink {src} -> {dst}"
+        src.unlink()
+        return f"removed symlink {src} (already pointed at {dst})"
+    if src.exists() and src.resolve() == dst.resolve():
+        return f"{src} and {dst} are the same path; nothing to migrate"
+    if not src.is_dir():
+        return f"{src} is not a directory; skipping migration"
+
+    if dry_run:
+        entries = list(src.iterdir())
+        if not entries:
+            return f"[DRY-RUN] would remove empty {src}"
+        sample = ", ".join(e.name for e in entries[:3])
+        more = f" (+{len(entries) - 3} more)" if len(entries) > 3 else ""
+        return f"[DRY-RUN] would move {len(entries)} entries from {src} to {dst} (e.g. {sample}{more}), then rmdir {src}"
+
+    dst.mkdir(parents=True, exist_ok=True)
+    moved, failed = 0, []
+    for entry in src.iterdir():
+        try:
+            # ``shutil.move`` uses os.rename() on the same FS and
+            # copy+delete across FS boundaries. tmpfs is almost
+            # always a different FS from disk, so the cross-FS path
+            # is what runs in practice. Existing files in dst are
+            # overwritten by the copy step.
+            shutil.move(str(entry), str(dst / entry.name))
+            moved += 1
+        except OSError as exc:
+            failed.append(f"{entry.name}: {exc}")
+
+    cleanup_msg = ""
+    try:
+        src.rmdir()
+        cleanup_msg = f", removed empty {src}"
+    except OSError:
+        leftover = list(src.iterdir())
+        if leftover:
+            names = ", ".join(e.name for e in leftover[:3])
+            cleanup_msg = (
+                f", {src} not empty (kept for manual cleanup; "
+                f"sample leftover: {names})"
+            )
+        else:
+            cleanup_msg = f", {src} kept (permission issue)"
+
+    if failed:
+        return (
+            f"migrated {moved} entries to {dst}{cleanup_msg}; "
+            f"failed: {'; '.join(failed)}"
+        )
+    return f"migrated {moved} entries to {dst}{cleanup_msg}"
+
+
+# ---------------------------------------------------------------------------
+# Per-tool configure_*
+# ---------------------------------------------------------------------------
+
+
+def configure_maven(
+    mount_point: str, dry_run: bool = False, migrate: bool = True
+) -> str:
     """Configure Maven localRepository to use RAM disk."""
     m2_dir = Path.home() / ".m2"
     new_repo = Path(mount_point) / "maven-repo"
     settings_file = m2_dir / "settings.xml"
     if dry_run:
-        return f"[DRY-RUN] Would set Maven localRepository to {new_repo}"
+        msg = f"[DRY-RUN] Would set Maven localRepository to {new_repo}"
+        if migrate:
+            msg += f"; {migrate_directory(OLD_PATHS['maven'], new_repo, dry_run=True)}"
+        return msg
     m2_dir.mkdir(parents=True, exist_ok=True)
     new_repo.mkdir(parents=True, exist_ok=True)
     if not settings_file.exists():
         settings_file.write_text(
-            "\u003csettings\u003e\n"
-            f'  \u003clocalRepository\u003e{new_repo}\u003c/localRepository\u003e\n'
-            "\u003c/settings\u003e\n"
+            "<settings>\n"
+            f"  <localRepository>{new_repo}</localRepository>\n"
+            "</settings>\n"
         )
-        return f"Created {settings_file} with localRepository={new_repo}"
-    backup = _backup_file(settings_file)
-    content = settings_file.read_text()
-    if "\u003clocalRepository\u003e" in content:
-        content = re.sub(
-            r"\u003clocalRepository\u003e.*?\u003c/localRepository\u003e",
-            f"\u003clocalRepository\u003e{new_repo}\u003c/localRepository\u003e",
-            content,
-            count=1,
-        )
+        configure_msg = f"Created {settings_file} with localRepository={new_repo}"
     else:
-        content = content.replace(
-            "\u003c/settings\u003e",
-            f"  \u003clocalRepository\u003e{new_repo}\u003c/localRepository\u003e\n\u003c/settings\u003e",
-        )
-    settings_file.write_text(content)
-    return f"Updated Maven localRepository to {new_repo} (backup: {backup})"
+        backup = _backup_file(settings_file)
+        content = settings_file.read_text()
+        if "<localRepository>" in content:
+            content = re.sub(
+                r"<localRepository>.*?</localRepository>",
+                f"<localRepository>{new_repo}</localRepository>",
+                content,
+                count=1,
+            )
+        else:
+            content = content.replace(
+                "</settings>",
+                f"  <localRepository>{new_repo}</localRepository>\n</settings>",
+            )
+        settings_file.write_text(content)
+        configure_msg = f"Updated Maven localRepository to {new_repo} (backup: {backup})"
+
+    if migrate:
+        configure_msg += f"; {migrate_directory(OLD_PATHS['maven'], new_repo)}"
+    return configure_msg
 
 
-def configure_gradle(mount_point: str, dry_run: bool = False) -> str:
+def configure_gradle(
+    mount_point: str, dry_run: bool = False, migrate: bool = True
+) -> str:
     """Configure Gradle user home to use RAM disk."""
     new_home = Path(mount_point) / "gradle"
     if dry_run:
-        return f"[DRY-RUN] Would set GRADLE_USER_HOME={new_home}"
+        msg = f"[DRY-RUN] Would set GRADLE_USER_HOME={new_home}"
+        if migrate:
+            msg += f"; {migrate_directory(OLD_PATHS['gradle'], new_home, dry_run=True)}"
+        return msg
     new_home.mkdir(parents=True, exist_ok=True)
     env_line = f'export GRADLE_USER_HOME="{new_home}"\n'
-    result = _add_or_replace_in_shell_rc("GRADLE_USER_HOME", env_line)
-    return f"Set GRADLE_USER_HOME={new_home} ({result})"
+    configure_msg = f"Set GRADLE_USER_HOME={new_home} ({_add_or_replace_in_shell_rc('GRADLE_USER_HOME', env_line)})"
+    if migrate:
+        configure_msg += f"; {migrate_directory(OLD_PATHS['gradle'], new_home)}"
+    return configure_msg
 
 
-def configure_npm(mount_point: str, dry_run: bool = False) -> str:
+def configure_npm(
+    mount_point: str, dry_run: bool = False, migrate: bool = True
+) -> str:
     """Configure npm cache to use RAM disk."""
     new_cache = Path(mount_point) / "npm"
     if dry_run:
-        return f"[DRY-RUN] Would run: npm config set cache {new_cache} --global"
+        msg = f"[DRY-RUN] Would run: npm config set cache {new_cache} --global"
+        if migrate:
+            # npm's official cache is ~/.npm/_cacache; surface that path
+            # in the dry-run report so the user can see what would move.
+            old_npm_cache = Path.home() / ".npm" / "_cacache"
+            msg += f"; {migrate_directory(old_npm_cache, new_cache, dry_run=True)}"
+        return msg
     new_cache.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.run(
             ["npm", "config", "set", "cache", str(new_cache), "--global"],
             check=True, capture_output=True, text=True,
         )
-        return f"Set npm cache to {new_cache}"
+        configure_msg = f"Set npm cache to {new_cache}"
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         return f"npm command failed ({e}); manually set: npm config set cache {new_cache}"
+    if migrate:
+        # npm's actual cache directory is ~/.npm/_cacache (not the whole
+        # ~/.npm). The rest of ~/.npm (config etc.) stays put.
+        old_npm_cache = Path.home() / ".npm" / "_cacache"
+        configure_msg += f"; {migrate_directory(old_npm_cache, new_cache)}"
+    return configure_msg
 
 
-def configure_pnpm(mount_point: str, dry_run: bool = False) -> str:
+def configure_pnpm(
+    mount_point: str, dry_run: bool = False, migrate: bool = True
+) -> str:
     """Configure pnpm store to use RAM disk."""
     new_store = Path(mount_point) / "pnpm"
     if dry_run:
-        return f"[DRY-RUN] Would run: pnpm config set store-dir {new_store}"
+        msg = f"[DRY-RUN] Would run: pnpm config set store-dir {new_store}"
+        if migrate:
+            msg += f"; {migrate_directory(OLD_PATHS['pnpm'], new_store, dry_run=True)}"
+        return msg
     new_store.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.run(
             ["pnpm", "config", "set", "store-dir", str(new_store)],
             check=True, capture_output=True, text=True,
         )
-        return f"Set pnpm store-dir to {new_store}"
+        configure_msg = f"Set pnpm store-dir to {new_store}"
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         return f"pnpm command failed ({e}); manually set: pnpm config set store-dir {new_store}"
+    if migrate:
+        configure_msg += f"; {migrate_directory(OLD_PATHS['pnpm'], new_store)}"
+    return configure_msg
 
 
-def configure_pip(mount_point: str, dry_run: bool = False) -> str:
+def configure_pip(
+    mount_point: str, dry_run: bool = False, migrate: bool = True
+) -> str:
     """Configure pip cache to use RAM disk."""
     new_cache = Path(mount_point) / "pip"
     if dry_run:
-        return f"[DRY-RUN] Would set PIP_CACHE_DIR={new_cache}"
+        msg = f"[DRY-RUN] Would set PIP_CACHE_DIR={new_cache}"
+        if migrate:
+            msg += f"; {migrate_directory(OLD_PATHS['pip'], new_cache, dry_run=True)}"
+        return msg
     new_cache.mkdir(parents=True, exist_ok=True)
     env_line = f'export PIP_CACHE_DIR="{new_cache}"\n'
-    result = _add_or_replace_in_shell_rc("PIP_CACHE_DIR", env_line)
-    return f"Set PIP_CACHE_DIR={new_cache} ({result})"
+    configure_msg = f"Set PIP_CACHE_DIR={new_cache} ({_add_or_replace_in_shell_rc('PIP_CACHE_DIR', env_line)})"
+    if migrate:
+        configure_msg += f"; {migrate_directory(OLD_PATHS['pip'], new_cache)}"
+    return configure_msg
 
 
-def configure_cargo(mount_point: str, dry_run: bool = False) -> str:
+def configure_cargo(
+    mount_point: str, dry_run: bool = False, migrate: bool = True
+) -> str:
     """Configure cargo home to use RAM disk."""
     new_home = Path(mount_point) / "cargo"
     if dry_run:
-        return f"[DRY-RUN] Would set CARGO_HOME={new_home}"
+        msg = f"[DRY-RUN] Would set CARGO_HOME={new_home}"
+        if migrate:
+            msg += f"; {migrate_directory(OLD_PATHS['cargo'], new_home, dry_run=True)}"
+        return msg
     new_home.mkdir(parents=True, exist_ok=True)
     env_line = f'export CARGO_HOME="{new_home}"\n'
-    result = _add_or_replace_in_shell_rc("CARGO_HOME", env_line)
-    return f"Set CARGO_HOME={new_home} ({result})"
+    configure_msg = f"Set CARGO_HOME={new_home} ({_add_or_replace_in_shell_rc('CARGO_HOME', env_line)})"
+    if migrate:
+        configure_msg += f"; {migrate_directory(OLD_PATHS['cargo'], new_home)}"
+    return configure_msg
 
 
-def configure_tmpdir(mount_point: str, dry_run: bool = False) -> str:
-    """Configure TMPDIR to use RAM disk."""
+def configure_tmpdir(
+    mount_point: str, dry_run: bool = False, migrate: bool = True
+) -> str:
+    """Configure TMPDIR to use RAM disk.
+
+    ``migrate`` is accepted for API symmetry with the other configure_*
+    functions but is intentionally a no-op for TMPDIR: copying ``/tmp``
+    is unsafe (system-managed, may contain live sockets / held file
+    descriptors) and most distributions already mount ``/tmp`` on tmpfs.
+    """
     new_tmp = Path(mount_point) / "tmp"
     if dry_run:
-        return f"[DRY-RUN] Would set TMPDIR={new_tmp}"
+        return f"[DRY-RUN] Would set TMPDIR={new_tmp} (no migration; /tmp is system-managed)"
     new_tmp.mkdir(parents=True, exist_ok=True)
     env_line = f'export TMPDIR="{new_tmp}"\n'
-    result = _add_or_replace_in_shell_rc("TMPDIR", env_line)
-    return f"Set TMPDIR={new_tmp} ({result})"
+    return (
+        f"Set TMPDIR={new_tmp} "
+        f"({_add_or_replace_in_shell_rc('TMPDIR', env_line)})"
+    )
 
 
-def configure_docker_buildkit(mount_point: str, dry_run: bool = False) -> str:
+def configure_docker_buildkit(
+    mount_point: str, dry_run: bool = False, migrate: bool = True
+) -> str:
     """Print Docker BuildKit cache mount hints."""
+    # No migration: BuildKit cache lives in the build-time mount, not
+    # in a persistent on-disk path. ``migrate`` is accepted for API
+    # symmetry but is intentionally a no-op here.
     return (
         "Docker BuildKit cache mount hints:\n"
         "  # In your Dockerfile:\n"
-        "  RUN --mount=type=cache,target=/root/.m2 \\n"
+        "  RUN --mount=type=cache,target=/root/.m2 \\\n"
         "      mvn package\n"
-        "  RUN --mount=type=cache,target=/root/.npm \\n"
+        "  RUN --mount=type=cache,target=/root/.npm \\\n"
         "      npm ci\n"
         "  # Enable BuildKit: export DOCKER_BUILDKIT=1"
     )
+
+
+# ---------------------------------------------------------------------------
+# Shell-rc helpers (unchanged)
+# ---------------------------------------------------------------------------
 
 
 def _backup_file(path: Path) -> str:
