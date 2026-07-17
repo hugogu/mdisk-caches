@@ -113,8 +113,11 @@ def test_get_shell_rc_fallback():
 # ---------------------------------------------------------------------------
 # Migration tests
 # ---------------------------------------------------------------------------
+#
+# These tests follow the project pattern of `with
+# tempfile.TemporaryDirectory() as tmp:` and `Path.home = lambda: fake_home`
+# instead of pytest fixtures (run_tests.py is a stdlib-only runner).
 
-import shutil as _shutil
 from mdisk_caches.configure import migrate_directory, OLD_PATHS
 
 
@@ -123,112 +126,136 @@ def _write(p, content="x"):
     p.write_text(content)
 
 
-def test_migrate_directory_no_old_data(tmp_path, monkeypatch):
+def _in_tmp(tmp, fn):
+    """Run ``fn(Path(tmp))`` with Path.home() redirected to a fake HOME."""
+    fake_home = Path(tmp) / "home"
+    fake_home.mkdir()
+    original_home = Path.home
+    Path.home = lambda: fake_home
+    try:
+        return fn(fake_home)
+    finally:
+        Path.home = original_home
+
+
+def test_migrate_directory_no_old_data():
     """No source directory => 'nothing to migrate'."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    src = tmp_path / "old"          # does not exist
-    dst = tmp_path / "new"
-    result = migrate_directory(src, dst)
-    assert "nothing to migrate" in result
-    assert not dst.exists()
+    with tempfile.TemporaryDirectory() as tmp:
+        def run(fake_home):
+            src = fake_home / "old"  # does not exist
+            dst = fake_home / "new"
+            result = migrate_directory(src, dst)
+            assert "nothing to migrate" in result
+            assert not dst.exists()
+        _in_tmp(tmp, run)
 
 
-def test_migrate_directory_dry_run_reports(tmp_path, monkeypatch):
+def test_migrate_directory_dry_run_reports():
     """Dry-run must NOT move data, only report the planned move."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    src = tmp_path / "old"
-    dst = tmp_path / "new"
-    _write(src / "a.bin", "AAA")
-    _write(src / "b.bin", "BBB")
-    result = migrate_directory(src, dst, dry_run=True)
-    assert "[DRY-RUN]" in result
-    assert "2 entries" in result
-    # Old data untouched
-    assert (src / "a.bin").read_text() == "AAA"
-    assert (src / "b.bin").read_text() == "BBB"
-    assert not dst.exists()
+    with tempfile.TemporaryDirectory() as tmp:
+        def run(fake_home):
+            src = fake_home / "old"
+            dst = fake_home / "new"
+            _write(src / "a.bin", "AAA")
+            _write(src / "b.bin", "BBB")
+            result = migrate_directory(src, dst, dry_run=True)
+            assert "[DRY-RUN]" in result
+            assert "2 entries" in result
+            # Old data untouched
+            assert (src / "a.bin").read_text() == "AAA"
+            assert (src / "b.bin").read_text() == "BBB"
+            assert not dst.exists()
+        _in_tmp(tmp, run)
 
 
-def test_migrate_directory_moves_and_cleans(tmp_path, monkeypatch):
+def test_migrate_directory_moves_and_cleans():
     """When src has data and is emptyable, src is removed after move."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    src = tmp_path / "old"
-    dst = tmp_path / "new"
-    _write(src / "a.bin", "AAA")
-    _write(src / "sub" / "b.bin", "BBB")
-    result = migrate_directory(src, dst)
-    assert "migrated 2 entries" in result
-    assert "removed empty" in result
-    assert (dst / "a.bin").read_text() == "AAA"
-    assert (dst / "sub" / "b.bin").read_text() == "BBB"
-    assert not src.exists()
+    with tempfile.TemporaryDirectory() as tmp:
+        def run(fake_home):
+            src = fake_home / "old"
+            dst = fake_home / "new"
+            _write(src / "a.bin", "AAA")
+            _write(src / "sub" / "b.bin", "BBB")
+            result = migrate_directory(src, dst)
+            assert "migrated 2 entries" in result
+            assert "removed empty" in result
+            assert (dst / "a.bin").read_text() == "AAA"
+            assert (dst / "sub" / "b.bin").read_text() == "BBB"
+            assert not src.exists()
+        _in_tmp(tmp, run)
 
 
-def test_migrate_directory_keeps_nonempty_old(tmp_path, monkeypatch):
+def test_migrate_directory_keeps_nonempty_old():
     """Hidden files in src keep the old directory around (no data loss)."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    src = tmp_path / "old"
-    dst = tmp_path / "new"
-    _write(src / "a.bin", "AAA")
-    _write(src / ".hidden", "do-not-move")
-    result = migrate_directory(src, dst)
-    assert "migrated 1 entries" in result
-    assert "not empty" in result
-    assert (dst / "a.bin").read_text() == "AAA"
-    # src retained because .hidden is still there
-    assert src.exists()
-    assert (src / ".hidden").read_text() == "do-not-move"
+    with tempfile.TemporaryDirectory() as tmp:
+        def run(fake_home):
+            src = fake_home / "old"
+            dst = fake_home / "new"
+            _write(src / "a.bin", "AAA")
+            _write(src / ".hidden", "do-not-move")
+            result = migrate_directory(src, dst)
+            assert "migrated 1 entries" in result
+            assert "not empty" in result
+            assert (dst / "a.bin").read_text() == "AAA"
+            # src retained because .hidden is still there
+            assert src.exists()
+            assert (src / ".hidden").read_text() == "do-not-move"
+        _in_tmp(tmp, run)
 
 
-def test_migrate_directory_idempotent_same_path(tmp_path, monkeypatch):
+def test_migrate_directory_idempotent_same_path():
     """If src resolves to dst (e.g. user symlinked it), no-op."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    real = tmp_path / "real"
-    real.mkdir()
-    _write(real / "x", "X")
-    # src is a symlink that points to real
-    src = tmp_path / "link"
-    src.symlink_to(real)
-    # dst == real
-    result = migrate_directory(src, real)
-    assert "same path" in result
-    # The symlink should still be there
-    assert src.is_symlink()
+    with tempfile.TemporaryDirectory() as tmp:
+        def run(fake_home):
+            real = fake_home / "real"
+            real.mkdir()
+            _write(real / "x", "X")
+            # src is a symlink that points to real
+            src = fake_home / "link"
+            src.symlink_to(real)
+            # dst == real
+            result = migrate_directory(src, real)
+            assert "same path" in result
+            # The symlink should still be there
+            assert src.is_symlink()
+        _in_tmp(tmp, run)
 
 
-def test_migrate_directory_removes_dangling_symlink(tmp_path, monkeypatch):
+def test_migrate_directory_removes_dangling_symlink():
     """A symlink already pointing at dst can be safely removed."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    src = tmp_path / "link"
-    dst = tmp_path / "dst"
-    dst.mkdir()
-    src.symlink_to(dst)
-    result = migrate_directory(src, dst)
-    assert "removed symlink" in result
-    assert not src.exists()
-    assert dst.exists()
+    with tempfile.TemporaryDirectory() as tmp:
+        def run(fake_home):
+            src = fake_home / "link"
+            dst = fake_home / "dst"
+            dst.mkdir()
+            src.symlink_to(dst)
+            result = migrate_directory(src, dst)
+            assert "removed symlink" in result
+            assert not src.exists()
+            assert dst.exists()
+        _in_tmp(tmp, run)
 
 
-def test_configure_maven_migrates_old_repo(tmp_path, monkeypatch):
+def test_configure_maven_migrates_old_repo():
     """End-to-end: configure_maven moves ~/.m2/repository to <mount>/maven-repo."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    old_repo = tmp_path / ".m2" / "repository"
-    _write(old_repo / "com" / "foo" / "bar.jar", "fakejar")
-    # Point maven settings at our mock HOME; configure_maven uses
-    # Path.home() via monkeypatch.
-    from mdisk_caches import configure as cfg
-    out = cfg.configure_maven(str(tmp_path / "mnt"), dry_run=True)
-    assert "localRepository" in out
-    # Dry-run must NOT move data
-    assert (old_repo / "com" / "foo" / "bar.jar").exists()
-    # Now run for real
-    out = cfg.configure_maven(str(tmp_path / "mnt"))
-    new_repo = tmp_path / "mnt" / "maven-repo"
-    assert (new_repo / "com" / "foo" / "bar.jar").read_text() == "fakejar"
-    assert not old_repo.exists()
-    # settings.xml exists, points at new repo
-    s = (tmp_path / ".m2" / "settings.xml").read_text()
-    assert str(new_repo) in s
+    with tempfile.TemporaryDirectory() as tmp:
+        def run(fake_home):
+            old_repo = fake_home / ".m2" / "repository"
+            _write(old_repo / "com" / "foo" / "bar.jar", "fakejar")
+            mnt = fake_home / "mnt"
+            out = configure_maven(str(mnt), dry_run=True)
+            assert "localRepository" in out
+            # Dry-run must NOT move data
+            assert (old_repo / "com" / "foo" / "bar.jar").exists()
+            # Now run for real
+            out = configure_maven(str(mnt))
+            new_repo = mnt / "maven-repo"
+            assert (new_repo / "com" / "foo" / "bar.jar").read_text() == "fakejar"
+            assert not old_repo.exists()
+            # settings.xml exists, points at new repo
+            s = (fake_home / ".m2" / "settings.xml").read_text()
+            assert str(new_repo) in s
+        _in_tmp(tmp, run)
 
 
 def test_old_paths_known_tools():
