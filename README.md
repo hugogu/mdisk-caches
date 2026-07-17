@@ -131,6 +131,45 @@ old directory. The migration is:
 Tools without an on-disk cache to migrate (`tmpdir`, `docker_buildkit`)
 are no-ops for the migration step.
 
+### Restore original tool configuration
+
+To stop using the RAM disk and return tools to their original cache
+locations, run `restore`. By default, `restore` also migrates any data
+still on the RAM disk back to the original on-disk locations, then
+unmounts and releases the RAM disk.
+
+```bash
+# Preview full restore
+mdisk-caches restore --all --dry-run
+
+# Restore all tools, move data back, and unmount the RAM disk
+mdisk-caches restore --all --yes
+
+# Restore a single tool
+mdisk-caches restore --tool maven --yes
+
+# Restore without moving data back
+mdisk-caches restore --all --yes --no-migrate
+
+# Restore configs but keep the RAM disk mounted
+mdisk-caches restore --all --yes --no-cleanup
+```
+
+Per-tool behavior:
+
+- **Maven**: restores `~/.m2/settings.xml` from the `.backup` file if it
+  exists; otherwise removes the RAM disk `localRepository` entry.
+- **Gradle / pip / cargo / TMPDIR**: removes the corresponding env var
+  from the shell rc.
+- **npm**: runs `npm config delete cache --global`.
+- **pnpm**: runs `pnpm config delete store-dir`.
+- **Docker BuildKit**: no-op (no persistent config to restore).
+
+If `--no-migrate` is not given, data is moved from the RAM disk cache
+path back to each tool's original location using the same cross-filesystem
+`shutil.move` logic as `migrate`. After the migration, the RAM disk is
+unmounted unless `--no-cleanup` is given.
+
 ### Check status
 
 ```bash

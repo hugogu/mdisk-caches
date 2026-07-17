@@ -13,7 +13,7 @@ from mdisk_caches.mount import (
     is_mounted,
     get_disk_usage,
 )
-from mdisk_caches.configure import configure_all, SUPPORTED_TOOLS, OLD_PATHS, migrate_directory
+from mdisk_caches.configure import configure_all, SUPPORTED_TOOLS, OLD_PATHS, migrate_directory, restore_all
 from mdisk_caches.report import generate_report
 
 
@@ -119,6 +119,44 @@ def cmd_migrate(args):
         new_path = Path(mount_point) / tool
         result = migrate_directory(old_path, new_path, dry_run=args.dry_run)
         print(f"{tool:15} {result}")
+
+
+def cmd_restore(args):
+    """Restore tools to their original cache locations and release RAM disk."""
+    from mdisk_caches.detect import SystemInfo
+    from mdisk_caches.recommend import recommend
+
+    info = SystemInfo()
+    rec = recommend(info)
+    mount_point = args.mount or rec["mount_point"]
+
+    if not args.all and not args.tool:
+        print("Error: specify --tool or --all")
+        sys.exit(1)
+
+    tools = [args.tool] if args.tool else SUPPORTED_TOOLS
+
+    if not args.dry_run and not args.yes:
+        msg = (
+            f"Restore {', '.join(tools)} to original locations and "
+            f"remove RAM disk at {mount_point}? [y/N] "
+        )
+        if input(msg).lower() != "y":
+            print("Aborted.")
+            return
+
+    results = restore_all(
+        mount_point, dry_run=args.dry_run, migrate=not args.no_migrate
+    )
+    for t in tools:
+        print(f"{t:15} {results.get(t, 'not supported')}")
+
+    if not args.dry_run and not args.no_cleanup:
+        if not is_mounted(mount_point):
+            print(f"⚠ Mount point {mount_point} is not mounted.")
+        else:
+            result = remove_ramdisk(mount_point, dry_run=False)
+            print(result)
 
 
 def cmd_cleanup(args):
@@ -239,6 +277,27 @@ def main():
     p_migrate.add_argument("--dry-run", action="store_true", help="Show what would be done")
     p_migrate.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
     p_migrate.set_defaults(func=cmd_migrate)
+
+    # restore
+    p_restore = subparsers.add_parser(
+        "restore", help="Restore tools to original locations and remove RAM disk"
+    )
+    p_restore.add_argument("--mount", "-m", default=None, help="Mount point")
+    p_restore.add_argument("--tool", "-t", default=None, help="Tool to restore")
+    p_restore.add_argument("--all", action="store_true", help="Restore all tools")
+    p_restore.add_argument("--dry-run", action="store_true", help="Show what would be done")
+    p_restore.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+    p_restore.add_argument(
+        "--no-migrate",
+        action="store_true",
+        help="Skip moving data back from RAM disk to original locations",
+    )
+    p_restore.add_argument(
+        "--no-cleanup",
+        action="store_true",
+        help="Skip removing the RAM disk after restoring configs",
+    )
+    p_restore.set_defaults(func=cmd_restore)
 
     # status
     p_status = subparsers.add_parser("status", help="Show current RAM disk status")

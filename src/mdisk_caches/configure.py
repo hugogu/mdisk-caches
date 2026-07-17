@@ -35,6 +35,23 @@ OLD_PATHS: Dict[str, Callable[[], Path]] = {
 }
 
 
+def _get_new_path(tool: str, mount_point: str) -> Path:
+    """Return the RAM disk cache path for a tool.
+
+    This mirrors the paths chosen by the configure_* implementations so
+    restore/migrate can reason about them from a single table.
+    """
+    return {
+        "maven": Path(mount_point) / "maven-repo",
+        "gradle": Path(mount_point) / "gradle",
+        "npm": Path(mount_point) / "npm",
+        "pnpm": Path(mount_point) / "pnpm",
+        "pip": Path(mount_point) / "pip",
+        "cargo": Path(mount_point) / "cargo",
+        "tmpdir": Path(mount_point) / "tmp",
+    }[tool]
+
+
 def configure_all(
     mount_point: str,
     dry_run: bool = False,
@@ -49,6 +66,25 @@ def configure_all(
     results = {}
     for tool in SUPPORTED_TOOLS:
         func = globals().get(f"configure_{tool}")
+        if func:
+            results[tool] = func(mount_point, dry_run, migrate=migrate)
+    return results
+
+
+def restore_all(
+    mount_point: str,
+    dry_run: bool = False,
+    migrate: bool = True,
+) -> Dict[str, str]:
+    """Restore all supported tools to their original cache locations.
+
+    ``migrate`` controls whether existing data on the RAM disk is moved
+    back to the tool's original on-disk location before the disk is
+    released (default True).
+    """
+    results = {}
+    for tool in SUPPORTED_TOOLS:
+        func = globals().get(f"restore_{tool}")
         if func:
             results[tool] = func(mount_point, dry_run, migrate=migrate)
     return results
@@ -350,6 +386,172 @@ def configure_docker_buildkit(
     )
 
 
+def restore_maven(
+    mount_point: str, dry_run: bool = False, migrate: bool = True
+) -> str:
+    """Restore Maven localRepository to its default location."""
+    m2_dir = Path.home() / ".m2"
+    new_repo = _get_new_path("maven", mount_point)
+    old_repo = OLD_PATHS["maven"]()
+    settings_file = m2_dir / "settings.xml"
+    backup_file = settings_file.with_suffix(settings_file.suffix + ".backup")
+
+    if dry_run:
+        msg = "[DRY-RUN] Would restore Maven localRepository to default"
+        if migrate:
+            msg += f"; {migrate_directory(new_repo, old_repo, dry_run=True)}"
+        return msg
+
+    if backup_file.exists():
+        shutil.copy2(backup_file, settings_file)
+        restore_msg = f"Restored {settings_file} from backup"
+    elif settings_file.exists():
+        content = settings_file.read_text()
+        pattern = re.compile(
+            r"^\s*<localRepository>(.*?)</localRepository>\n?",
+            re.MULTILINE,
+        )
+        match = pattern.search(content)
+        if match and str(mount_point) in match.group(1):
+            content = pattern.sub("", content, count=1)
+            content = re.sub(r"\n{3,}", "\n\n", content)
+            settings_file.write_text(content)
+            restore_msg = f"Removed RAM disk localRepository from {settings_file}"
+        else:
+            restore_msg = f"No RAM disk localRepository found in {settings_file}"
+    else:
+        restore_msg = f"No {settings_file} to restore"
+
+    if migrate:
+        restore_msg += f"; {migrate_directory(new_repo, old_repo)}"
+    return restore_msg
+
+
+def restore_gradle(
+    mount_point: str, dry_run: bool = False, migrate: bool = True
+) -> str:
+    """Restore Gradle user home to its default location."""
+    new_home = _get_new_path("gradle", mount_point)
+    old_home = OLD_PATHS["gradle"]()
+    if dry_run:
+        msg = "[DRY-RUN] Would unset GRADLE_USER_HOME"
+        if migrate:
+            msg += f"; {migrate_directory(new_home, old_home, dry_run=True)}"
+        return msg
+    restore_msg = f"Removed GRADLE_USER_HOME ({_remove_from_shell_rc('GRADLE_USER_HOME')})"
+    if migrate:
+        restore_msg += f"; {migrate_directory(new_home, old_home)}"
+    return restore_msg
+
+
+def restore_npm(
+    mount_point: str, dry_run: bool = False, migrate: bool = True
+) -> str:
+    """Restore npm cache to its default location."""
+    new_cache = _get_new_path("npm", mount_point)
+    old_cache = Path.home() / ".npm" / "_cacache"
+    if dry_run:
+        msg = "[DRY-RUN] Would run: npm config delete cache --global"
+        if migrate:
+            msg += f"; {migrate_directory(new_cache, old_cache, dry_run=True)}"
+        return msg
+    try:
+        subprocess.run(
+            ["npm", "config", "delete", "cache", "--global"],
+            check=True, capture_output=True, text=True,
+        )
+        restore_msg = "Deleted npm cache config"
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        restore_msg = (
+            f"npm command failed ({e}); "
+            f"manually run: npm config delete cache --global"
+        )
+    if migrate:
+        restore_msg += f"; {migrate_directory(new_cache, old_cache)}"
+    return restore_msg
+
+
+def restore_pnpm(
+    mount_point: str, dry_run: bool = False, migrate: bool = True
+) -> str:
+    """Restore pnpm store to its default location."""
+    new_store = _get_new_path("pnpm", mount_point)
+    old_store = OLD_PATHS["pnpm"]()
+    if dry_run:
+        msg = "[DRY-RUN] Would run: pnpm config delete store-dir"
+        if migrate:
+            msg += f"; {migrate_directory(new_store, old_store, dry_run=True)}"
+        return msg
+    try:
+        subprocess.run(
+            ["pnpm", "config", "delete", "store-dir"],
+            check=True, capture_output=True, text=True,
+        )
+        restore_msg = "Deleted pnpm store-dir config"
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        restore_msg = (
+            f"pnpm command failed ({e}); "
+            f"manually run: pnpm config delete store-dir"
+        )
+    if migrate:
+        restore_msg += f"; {migrate_directory(new_store, old_store)}"
+    return restore_msg
+
+
+def restore_pip(
+    mount_point: str, dry_run: bool = False, migrate: bool = True
+) -> str:
+    """Restore pip cache to its default location."""
+    new_cache = _get_new_path("pip", mount_point)
+    old_cache = OLD_PATHS["pip"]()
+    if dry_run:
+        msg = "[DRY-RUN] Would unset PIP_CACHE_DIR"
+        if migrate:
+            msg += f"; {migrate_directory(new_cache, old_cache, dry_run=True)}"
+        return msg
+    restore_msg = f"Removed PIP_CACHE_DIR ({_remove_from_shell_rc('PIP_CACHE_DIR')})"
+    if migrate:
+        restore_msg += f"; {migrate_directory(new_cache, old_cache)}"
+    return restore_msg
+
+
+def restore_cargo(
+    mount_point: str, dry_run: bool = False, migrate: bool = True
+) -> str:
+    """Restore cargo home to its default location."""
+    new_home = _get_new_path("cargo", mount_point)
+    old_home = OLD_PATHS["cargo"]()
+    if dry_run:
+        msg = "[DRY-RUN] Would unset CARGO_HOME"
+        if migrate:
+            msg += f"; {migrate_directory(new_home, old_home, dry_run=True)}"
+        return msg
+    restore_msg = f"Removed CARGO_HOME ({_remove_from_shell_rc('CARGO_HOME')})"
+    if migrate:
+        restore_msg += f"; {migrate_directory(new_home, old_home)}"
+    return restore_msg
+
+
+def restore_tmpdir(
+    mount_point: str, dry_run: bool = False, migrate: bool = True
+) -> str:
+    """Restore TMPDIR to its default value.
+
+    ``migrate`` is accepted for API symmetry but is intentionally a no-op
+    for TMPDIR: ``/tmp`` is system-managed and should not be copied back.
+    """
+    if dry_run:
+        return "[DRY-RUN] Would unset TMPDIR (no migration; /tmp is system-managed)"
+    return f"Removed TMPDIR ({_remove_from_shell_rc('TMPDIR')})"
+
+
+def restore_docker_buildkit(
+    mount_point: str, dry_run: bool = False, migrate: bool = True
+) -> str:
+    """Docker BuildKit has no persistent config to restore."""
+    return "Docker BuildKit has no persistent config to restore"
+
+
 # ---------------------------------------------------------------------------
 # Shell-rc helpers (unchanged)
 # ---------------------------------------------------------------------------
@@ -379,6 +581,36 @@ def _add_or_replace_in_shell_rc(var_name: str, env_line: str) -> str:
         f.write(f"\n# mdisk-caches: {var_name}\n")
         f.write(env_line)
     return f"added to {shell_rc}"
+
+
+def _remove_from_shell_rc(var_name: str) -> str:
+    """Remove an mdisk-caches env var from shell rc.
+
+    Removes both the ``# mdisk-caches: VAR_NAME`` comment and the
+    ``export VAR_NAME=...`` line. Returns a status string.
+    """
+    shell_rc = _get_shell_rc()
+    if not shell_rc or not shell_rc.exists():
+        return "no shell rc found"
+
+    lines = shell_rc.read_text().splitlines()
+    new_lines = []
+    removed = False
+    comment_marker = f"# mdisk-caches: {var_name}"
+    export_prefix = f"export {var_name}="
+    for line in lines:
+        stripped = line.strip()
+        if stripped == comment_marker or stripped.startswith(export_prefix):
+            removed = True
+            continue
+        new_lines.append(line)
+    if not removed:
+        return f"{var_name} not found in {shell_rc}"
+
+    while new_lines and new_lines[-1].strip() == "":
+        new_lines.pop()
+    shell_rc.write_text("\n".join(new_lines) + "\n")
+    return f"Removed {var_name} from {shell_rc}"
 
 
 def _get_shell_rc() -> Optional[Path]:
